@@ -12,12 +12,10 @@ if not DB_PASSWORD: exit(1)
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-def run_command(command, timeout=60):
+def run_cmd(c, t=60):
     try:
-        result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True, timeout=timeout, cwd=PROJECT_DIR)
-        return {"success": True, "output": result.stdout.strip()}
-    except subprocess.TimeoutExpired: return {"success": False, "error": "Command timed out."}
-    except subprocess.CalledProcessError as e: return {"success": False, "output": e.stdout, "error": e.stderr}
+        r = subprocess.run(c, shell=True, check=True, capture_output=True, text=True, timeout=t, cwd=PROJECT_DIR)
+        return {"success": True, "output": r.stdout.strip()}
     except Exception as e: return {"success": False, "error": str(e)}
 
 @app.route('/')
@@ -25,60 +23,69 @@ def index(): return render_template('index.html')
 
 @app.route('/deploy', methods=['POST'])
 def deploy():
-    # 1. Ensure base security: Deny all external access to 27017 by default
-    run_command("sudo ufw deny 27017/tcp", timeout=10)
-    # 2. Standard deploy
-    run_command("docker compose pull", timeout=300)
-    return jsonify(run_command("docker compose up -d", timeout=60))
+    run_cmd("sudo ufw deny 27017/tcp", t=10)
+    run_cmd("docker compose pull", t=300)
+    return jsonify(run_cmd("docker compose up -d", t=60))
 
 @app.route('/get-rules', methods=['GET'])
 def get_rules():
-    # Parse 'ufw status' to find IPs allowed specifically for port 27017
-    res = run_command("sudo ufw status", timeout=5)
-    if not res["success"]: return jsonify({"rules": []})
-    
+    res = run_cmd("sudo ufw status", t=5)
     ips = []
-    # Regex looks for lines like: "27017/tcp  ALLOW IN  1.2.3.4"
-    for line in res["output"].split('\n'):
-        if '27017' in line and 'ALLOW' in line:
-            match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', line)
-            if match: ips.append(match.group(1))
-    # Remove duplicates and return
+    if res["success"]:
+        for line in res["output"].split('\n'):
+            if '27017' in line and 'ALLOW' in line:
+                m = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', line)
+                if m: ips.append(m.group(1))
     return jsonify({"rules": list(set(ips))})
 
 @app.route('/add-rule', methods=['POST'])
 def add_rule():
     ip = request.json.get('ip')
-    if not ip: return jsonify({"success": False, "error": "No IP."}), 400
-    # Insert rule at top (position 1) to ensure it overrides any generic denies
-    return jsonify(run_command(f"sudo ufw insert 1 allow from {shlex.quote(ip)} to any port 27017 proto tcp", timeout=10))
+    if not ip: return jsonify({"error": "No IP"}), 400
+    return jsonify(run_cmd(f"sudo ufw insert 1 allow from {shlex.quote(ip)} to any port 27017 proto tcp", t=10))
 
 @app.route('/delete-rule', methods=['POST'])
 def delete_rule():
     ip = request.json.get('ip')
-    if not ip: return jsonify({"success": False, "error": "No IP."}), 400
-    return jsonify(run_command(f"sudo ufw delete allow from {shlex.quote(ip)} to any port 27017 proto tcp", timeout=10))
+    if not ip: return jsonify({"error": "No IP"}), 400
+    return jsonify(run_cmd(f"sudo ufw delete allow from {shlex.quote(ip)} to any port 27017 proto tcp", t=10))
 
-# ... [KEEP YOUR EXISTING BACKUP/RESTORE/LOGS/STATUS FUNCTIONS EXACTLY AS THEY WERE] ...
-# (I omitted them here to save space, paste your LAST working Backup/Restore functions here)
-@app.route('/backup', methods=['GET', 'POST'])
+@app.route('/backup', methods=['GET'])
 def backup():
-    # ... paste your last working backup code here ...
-    pass # REMOVE THIS PASS WHEN YOU PASTE
+    f = os.path.join(UPLOAD_FOLDER, f"backup_{int(time.time())}.gz")
+    cmd = f"docker exec my-mongo-db mongodump --username=root --password={shlex.quote(DB_PASSWORD)} --authenticationDatabase=admin --archive --gzip"
+    try:
+        with open(f, 'wb') as fh: subprocess.run(cmd, shell=True, stdout=fh, check=True, timeout=120)
+        return send_file(f, as_attachment=True, download_name="mongo_backup.gz", mimetype="application/gzip")
+    except Exception as e: return f"Error: {e}", 500
+    finally:
+        # FIXED SYNTAX HERE
+        if os.path.exists(f):
+            time.sleep(1)
+            try: os.remove(f)
+            except: pass
 
 @app.route('/restore', methods=['POST'])
 def restore():
-     # ... paste your last working restore code here ...
-     pass # REMOVE THIS PASS WHEN YOU PASTE
+    if subprocess.run("docker inspect -f '{{.State.Running}}' my-mongo-db", shell=True, capture_output=True, text=True).stdout.strip() != 'true':
+        return jsonify({"success": False, "error": "DB not running"}), 400
+    file = request.files.get('backupFile')
+    if not file: return jsonify({"success": False, "error": "No file"}), 400
+    path = os.path.join(UPLOAD_FOLDER, secure_filename(file.filename))
+    file.save(path)
+    try:
+        if not run_cmd(f"docker cp {path} my-mongo-db:/tmp/restore.gz", t=60)["success"]: return jsonify({"error": "Copy failed"}), 500
+        return jsonify(run_cmd(f"docker exec my-mongo-db mongorestore --username=root --password={shlex.quote(DB_PASSWORD)} --authenticationDatabase=admin --archive=/tmp/restore.gz --gzip --drop --noIndexRestore --nsExclude=admin.*", t=300))
+    finally:
+        if os.path.exists(path): os.remove(path)
+        run_cmd("docker exec my-mongo-db rm -f /tmp/restore.gz", t=10)
 
 @app.route('/logs', methods=['GET'])
-def logs(): return jsonify(run_command("docker compose logs --tail=100", timeout=10))
+def logs(): return jsonify(run_cmd("docker compose logs --tail=100", t=10))
 
 @app.route('/status', methods=['GET'])
-def get_status():
-    try:
-        res = subprocess.run("docker inspect --format '{{.State.Status}}' my-mongo-db", shell=True, check=True, capture_output=True, text=True, timeout=5)
-        return jsonify({"success": True, "status": res.stdout.strip()})
+def status():
+    try: return jsonify({"success": True, "status": subprocess.run("docker inspect --format '{{.State.Status}}' my-mongo-db", shell=True, capture_output=True, text=True, timeout=5).stdout.strip()})
     except: return jsonify({"success": True, "status": "not_deployed"})
 
 if __name__ == '__main__':
